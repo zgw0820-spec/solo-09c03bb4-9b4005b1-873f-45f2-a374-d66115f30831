@@ -16,11 +16,13 @@ from dataclasses import dataclass
 
 from common.protocol import (
     BLKSIZE,
+    OP_ACK,
     OP_DATA,
     OP_ERROR,
     OP_OACK,
     build_ack,
     build_rrq,
+    build_wrq,
     parse_error,
     parse_oack,
     wire_num,
@@ -40,6 +42,9 @@ class ClientConfig:
     drop_first_oack: bool = False
     seed: int = 0
     linger: float = 0.2
+    # WRQ-only drill knobs
+    data_loss: float = 0.0       # drop outbound DATA (upload direction)
+    drop_final_ack: bool = False  # swallow the ACK of the final DATA block
 
 
 @dataclass
@@ -188,6 +193,125 @@ class TftpClient:
                 stats["out_of_order"] += 1
                 # re-affirm the highest contiguous block we have
                 self._ack(transport, server_addr, wire_num(expected - 1), rng, stats)
+
+    # ------------------------------------------------------------------ WRQ
+    async def upload(self, payload: bytes) -> ClientResult:
+        """Perform a real RFC 1350 WRQ upload of ``payload`` (octet, 512)."""
+        loop = asyncio.get_running_loop()
+        infos = await loop.getaddrinfo(
+            self.cfg.host, self.cfg.port, type=socket.SOCK_DGRAM
+        )
+        server = infos[0][4]
+        transport, proto = await loop.create_datagram_endpoint(
+            _ClientProtocol, local_addr=("0.0.0.0", 0)
+        )
+        try:
+            return await self._run_upload(transport, proto.queue, server, payload)
+        finally:
+            transport.close()
+
+    async def _run_upload(self, transport, queue, server, payload: bytes) -> ClientResult:
+        cfg = self.cfg
+        rng = random.Random(cfg.seed)
+        started = time.monotonic()
+        # exact multiples of 512 need an extra empty terminator block
+        blocks = [payload[i:i + BLKSIZE] for i in range(0, len(payload), BLKSIZE)]
+        if not blocks or len(payload) % BLKSIZE == 0:
+            blocks.append(b"")
+        total = len(blocks)
+        stats = {
+            "direction": "upload",
+            "packets": 0,
+            "wrq_sent": 1,
+            "data_packets": 0,
+            "data_drops": 0,
+            "blocks": total,
+            "bytes_sent": len(payload),
+            "acks": 0,
+            "final_ack_dropped": False,
+            "timeouts": 0,
+            "server_ports": set(),
+            "duplicate_acks": 0,
+        }
+        wrq = build_wrq(cfg.filename)
+        transport.sendto(wrq, server)
+        retries = 0
+        next_block = 0          # 0 = waiting for ACK 0, then DATA index 1..total
+        transfer_addr = None    # server transfer port learned from first reply
+        final_ack_swallowed = False
+
+        def send_data(index: int):
+            if rng.random() < cfg.data_loss:
+                stats["data_drops"] += 1
+                return  # simulated outbound DATA loss
+            pkt = struct.pack("!HH", OP_DATA, wire_num(index)) + blocks[index - 1]
+            transport.sendto(pkt, transfer_addr)
+            stats["data_packets"] += 1
+
+        while True:
+            try:
+                data, addr = await asyncio.wait_for(queue.get(), cfg.timeout)
+            except asyncio.TimeoutError:
+                retries += 1
+                stats["timeouts"] += 1
+                if retries > cfg.max_retries:
+                    return self._finish_upload(
+                        False, f"no response after {cfg.max_retries} retries",
+                        stats, started)
+                if next_block == 0:
+                    transport.sendto(wrq, server)  # WRQ lost: re-send it
+                    stats["wrq_sent"] += 1
+                else:
+                    send_data(next_block)          # DATA or its ACK got lost
+                continue
+
+            stats["packets"] += 1
+            stats["server_ports"].add(addr[1])
+            if len(data) < 2:
+                continue
+            op = struct.unpack("!H", data[:2])[0]
+            if op == OP_ERROR:
+                code, message = parse_error(data)
+                return self._finish_upload(
+                    False, f"server ERROR {code}: {message}", stats, started)
+            if op != OP_ACK or len(data) < 4:
+                continue
+            if transfer_addr is None:
+                transfer_addr = addr
+            elif addr != transfer_addr:
+                continue  # only the original transfer port may ACK
+            ack = struct.unpack("!H", data[2:4])[0]
+
+            if next_block == 0:
+                if ack != 0:
+                    continue
+                stats["acks"] += 1
+                next_block = 1
+                retries = 0
+                send_data(1)
+                continue
+
+            want = wire_num(next_block)
+            if ack == want:
+                stats["acks"] += 1
+                retries = 0
+                if next_block == total:
+                    # final ACK; optionally pretend it never arrived to prove
+                    # the server retransmits it from the same transfer port
+                    if cfg.drop_final_ack and not final_ack_swallowed:
+                        final_ack_swallowed = True
+                        stats["final_ack_dropped"] = True
+                        continue
+                    return self._finish_upload(True, None, stats, started)
+                next_block += 1
+                send_data(next_block)
+            else:
+                stats["duplicate_acks"] += 1  # re-ACK of an earlier block
+
+    def _finish_upload(self, ok, error, stats, started) -> ClientResult:
+        stats["elapsed_s"] = round(time.monotonic() - started, 3)
+        stats["server_ports"] = sorted(stats["server_ports"])
+        return ClientResult(ok, error, b"", stats)
 
     # ---------------------------------------------------------------- helpers
     def _ack(self, transport, addr, wire, rng, stats):

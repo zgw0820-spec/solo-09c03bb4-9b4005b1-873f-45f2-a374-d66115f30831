@@ -8,29 +8,45 @@ x-image-env: &image-env
   IMAGE_SIZE: ${IMAGE_SIZE:-131072}
   IMAGE_FILENAME: rescue.img
 
+# Archived logs are written by tftp-server and read back by the API, so the
+# two containers must mount the very same directory. Staging files live in a
+# separate directory and are never exposed through the API.
+x-upload-env: &upload-env
+  UPLOAD_ARCHIVE_DIR: /data/archive
+  UPLOAD_STAGING_DIR: /data/staging
+
 services:
   tftp-server:
     build:
       context: .
       dockerfile: Dockerfile.server
     environment:
-      <<: *image-env
+      <<: [*image-env, *upload-env]
       TFTP_BIND_HOST: 0.0.0.0
       TFTP_PORT: 69
       TFTP_TIMEOUT: 1.0
       TFTP_MAX_RETRIES: 5
+      UPLOAD_TIMEOUT: 2.0
+      UPLOAD_MAX_RETRIES: 5
     ports:
       - "6969:69/udp"
+    volumes:
+      - log-data:/data
 
   api:
     build:
       context: .
       dockerfile: Dockerfile.api
     environment:
-      <<: *image-env
+      <<: [*image-env, *upload-env]
       TFTP_SERVER_HOST: tftp-server
       TFTP_SERVER_PORT: 69
     ports:
       - "8000:8000"
+    volumes:
+      - log-data:/data
     depends_on:
       - tftp-server
+
+volumes:
+  log-data:

@@ -32,13 +32,21 @@ from common.protocol import (
     OP_ACK,
     OP_ERROR,
     OP_RRQ,
+    OP_WRQ,
     block_slice,
     build_error,
     build_oack,
     build_data,
-    parse_rrq,
+    parse_request,
     total_blocks_for,
     wire_num,
+)
+from server.upload import (
+    ArchiveStore,
+    UploadSession,
+    WorkOrderError,
+    parse_log_filename,
+    reject as reject_upload,
 )
 
 log = logging.getLogger("tftp.server")
@@ -256,17 +264,28 @@ class TftpServerService:
 
     def __init__(self, image: bytes, filename: str = "rescue.img",
                  bind_host: str = "0.0.0.0", port: int = 69,
-                 timeout: float = 1.0, max_retries: int = 5):
+                 timeout: float = 1.0, max_retries: int = 5,
+                 archive_dir: str = "/data/archive",
+                 staging_dir: str = "/data/staging",
+                 upload_timeout: float | None = None,
+                 upload_max_retries: int | None = None):
         self.image = image
         self.filename = filename
         self.bind_host = bind_host
         self.port = port
         self.timeout = timeout
         self.max_retries = max_retries
-        self.sessions = {}      # client addr -> TransferSession
-        self.history = []       # stats of finished sessions
+        self.sessions = {}      # client addr -> TransferSession (downloads)
+        self.history = []       # stats of finished download sessions
         self.transport = None
         self._tasks = set()
+        # WRQ log uploads
+        self.store = ArchiveStore(archive_dir, staging_dir)
+        self.store.startup_cleanup()
+        self.upload_timeout = upload_timeout if upload_timeout is not None else timeout
+        self.upload_max_retries = (
+            upload_max_retries if upload_max_retries is not None else max_retries
+        )
 
     async def start(self):
         loop = asyncio.get_running_loop()
@@ -282,6 +301,8 @@ class TftpServerService:
     async def stop(self):
         for session in list(self.sessions.values()):
             session._finish("aborted: server shutdown")
+        for session in list(self.store.active.values()):
+            session._finish("aborted: server shutdown")
         if self.transport is not None:
             self.transport.close()
 
@@ -289,6 +310,9 @@ class TftpServerService:
         if len(data) < 2:
             return
         op = struct.unpack("!H", data[:2])[0]
+        if op == OP_WRQ:
+            self._handle_wrq(data, addr)
+            return
         if op != OP_RRQ:
             return
         existing = self.sessions.get(addr)
@@ -296,7 +320,7 @@ class TftpServerService:
             existing.on_duplicate_rrq()
             return
         try:
-            filename, mode, options = parse_rrq(data)
+            filename, mode, options = parse_request(data)
         except ValueError as exc:
             self._send_error(addr, ERR_ILLEGAL_OP, f"malformed RRQ: {exc}")
             return
@@ -334,6 +358,60 @@ class TftpServerService:
         except Exception:
             log.exception("failed to start session for %s", session.client)
             session._finish("aborted: setup failure")
+
+    def _handle_wrq(self, data: bytes, addr):
+        """Front-door handling of a log upload request (RFC 1350 WRQ)."""
+        try:
+            filename, mode, options = parse_request(data)
+        except ValueError as exc:
+            reject_upload(self.transport, addr, ERR_ILLEGAL_OP,
+                          f"malformed WRQ: {exc}")
+            return
+        try:
+            work_order = parse_log_filename(filename)
+        except WorkOrderError as exc:
+            reject_upload(self.transport, addr, exc.code, exc.message)
+            return
+        if mode.lower() != "octet":
+            reject_upload(self.transport, addr, ERR_NOT_DEFINED,
+                          "only octet mode is supported")
+            return
+        # writes use plain RFC 1350: every block is 512 bytes, no negotiation
+        if options:
+            reject_upload(self.transport, addr, ERR_BAD_OPTION,
+                          "WRQ option negotiation is not supported")
+            return
+        session = UploadSession(
+            self.store, self, addr, work_order,
+            timeout=self.upload_timeout, max_retries=self.upload_max_retries,
+        )
+        try:
+            self.store.reserve(session)
+        except WorkOrderError as exc:
+            reject_upload(self.transport, addr, exc.code, exc.message)
+            return
+        except OSError as exc:
+            reject_upload(self.transport, addr, ERR_NOT_DEFINED,
+                          f"reservation failed: {exc}")
+            return
+        task = asyncio.get_running_loop().create_task(self._run_upload(session))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _run_upload(self, session: UploadSession):
+        try:
+            await session.start()
+        except OSError as exc:
+            log.exception("failed to start upload session for %s", session.client)
+            reject_upload(self.transport, session.client, ERR_NOT_DEFINED,
+                          f"cannot open staging file: {exc}")
+            session._finish("aborted: setup failure")
+        except Exception:
+            log.exception("failed to start upload session for %s", session.client)
+            session._finish("aborted: setup failure")
+
+    def upload_finished(self, session: UploadSession):
+        self.store.record_history(session.stats)
 
     def session_finished(self, session: TransferSession):
         if self.sessions.get(session.client) is session:
@@ -383,6 +461,10 @@ async def _amain():
         port=_env_int("TFTP_PORT", 69),
         timeout=_env_float("TFTP_TIMEOUT", 1.0),
         max_retries=_env_int("TFTP_MAX_RETRIES", 5),
+        archive_dir=os.environ.get("UPLOAD_ARCHIVE_DIR", "/data/archive"),
+        staging_dir=os.environ.get("UPLOAD_STAGING_DIR", "/data/staging"),
+        upload_timeout=_env_float("UPLOAD_TIMEOUT", 2.0),
+        upload_max_retries=_env_int("UPLOAD_MAX_RETRIES", 5),
     )
     await service.start()
     await asyncio.Event().wait()  # serve forever

@@ -7,6 +7,7 @@ import hashlib
 import logging
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -16,6 +17,9 @@ from server.tftp_server import TftpServerService
 from api.tftp_client import ClientConfig, TftpClient
 
 RESULTS = []
+
+# WRQ archive/staging need a writable location for the local (docker-less) run
+_DATA_ROOT = tempfile.mkdtemp(prefix="tftp-e2e-data-")
 
 
 def check(name, cond, detail=""):
@@ -29,8 +33,12 @@ def sha(data: bytes) -> str:
 
 async def start_server(size, seed="test-seed", timeout=1.0, max_retries=5):
     image = generate_image(size, seed)
-    service = TftpServerService(image, bind_host="127.0.0.1", port=0,
-                                timeout=timeout, max_retries=max_retries)
+    service = TftpServerService(
+        image, bind_host="127.0.0.1", port=0,
+        timeout=timeout, max_retries=max_retries,
+        archive_dir=os.path.join(_DATA_ROOT, "archive"),
+        staging_dir=os.path.join(_DATA_ROOT, "staging"),
+    )
     await service.start()
     return service, image
 

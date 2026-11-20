@@ -7,6 +7,7 @@ BLKSIZE = 512          # fixed block size, one block per DATA packet
 MAX_WINDOW = 16        # server-side cap for the RFC 7440 windowsize option
 
 OP_RRQ = 1
+OP_WRQ = 2
 OP_DATA = 3
 OP_ACK = 4
 OP_ERROR = 5
@@ -14,7 +15,10 @@ OP_OACK = 6
 
 ERR_NOT_DEFINED = 0
 ERR_FILE_NOT_FOUND = 1
+ERR_ACCESS_VIOLATION = 2
+ERR_DISK_FULL = 3
 ERR_ILLEGAL_OP = 4
+ERR_FILE_EXISTS = 6
 ERR_BAD_OPTION = 8
 
 
@@ -49,6 +53,11 @@ def build_rrq(filename: str, window: int) -> bytes:
         + b"blksize\x00" + str(BLKSIZE).encode() + b"\x00"
         + b"windowsize\x00" + str(window).encode() + b"\x00"
     )
+
+
+def build_wrq(filename: str) -> bytes:
+    """Plain RFC 1350 write request: octet mode, no options, fixed 512 blocks."""
+    return struct.pack("!H", OP_WRQ) + filename.encode() + b"\x00octet\x00"
 
 
 def build_ack(wire: int) -> bytes:
@@ -86,11 +95,11 @@ def parse_error(data: bytes):
     return code, data[4:].rstrip(b"\x00").decode("ascii", "replace")
 
 
-def parse_rrq(data: bytes):
-    """Return (filename, mode, options) or raise ValueError."""
+def parse_request(data: bytes):
+    """Parse an RRQ/WRQ body. Return (filename, mode, options) or raise ValueError."""
     parts = data[2:].split(b"\x00")
     if len(parts) < 3 or parts[-1] != b"":
-        raise ValueError("malformed RRQ")
+        raise ValueError("malformed request")
     parts = parts[:-1]
     filename = parts[0].decode("ascii", "replace")
     mode = parts[1].decode("ascii", "replace")
@@ -102,3 +111,8 @@ def parse_rrq(data: bytes):
         name = rest[i].decode("ascii", "replace").lower()
         options[name] = rest[i + 1].decode("ascii", "replace")
     return filename, mode, options
+
+
+def parse_rrq(data: bytes):
+    """Backwards-compatible alias for :func:`parse_request`."""
+    return parse_request(data)
